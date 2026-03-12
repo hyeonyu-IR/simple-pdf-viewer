@@ -17,7 +17,8 @@ Lightweight macOS PDF viewer built with SwiftUI + PDFKit.
 - Zoom state persistence across relaunch
 - Recent files (last 10): `File > Open Recent`
 - Lightweight text stamps: `Stamp Name`, `Stamp Date`, dashed placement preview, then click page to place
-- Move a placed stamp by dragging; delete selected stamp with `Delete` or `Delete Stamp` button
+- PNG signature stamp: import a `.png` signature once, then place it with dashed preview (persists across relaunch)
+- Move a placed stamp by dragging; resize selected stamp larger/smaller; delete selected stamp with `Delete` or `Delete Stamp` button
 - Save edited PDFs (`Cmd+S`) and save-as (`Shift+Cmd+S`)
 - Unsaved-change prompt when opening another PDF or closing window
 
@@ -34,6 +35,11 @@ Lightweight macOS PDF viewer built with SwiftUI + PDFKit.
 - `Shift+Cmd+S`: Save as new PDF
 - `Option+Cmd+N`: Stamp Name mode
 - `Option+Cmd+D`: Stamp Date mode
+- `Option+Cmd+I`: Import Signature
+- `Option+Cmd+S`: Stamp Signature mode
+- `Option+Cmd+]`: Larger selected stamp
+- `Option+Cmd+[`: Smaller selected stamp
+- `Delete`: Delete selected stamp
 
 ## App Metadata
 - `Hyeon's PDF Viewer > About Hyeon's PDF Viewer` shows app name, version, build, and credits.

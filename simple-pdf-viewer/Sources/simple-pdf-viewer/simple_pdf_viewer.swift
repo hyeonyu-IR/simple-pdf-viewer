@@ -27,9 +27,24 @@ struct ZoomRequest: Equatable {
     let action: ZoomAction
 }
 
+enum StampResizeAction: Equatable {
+    case larger
+    case smaller
+}
+
+struct StampResizeRequest: Equatable {
+    let id = UUID()
+    let action: StampResizeAction
+}
+
+enum PendingStampContent: Equatable {
+    case text(String)
+    case signatureImage(Data)
+}
+
 struct PendingStamp: Equatable {
     let id = UUID()
-    let text: String
+    let content: PendingStampContent
 }
 
 private enum StampStyle {
@@ -40,6 +55,10 @@ private enum StampStyle {
     static let verticalPadding: CGFloat = 6
     static let minWidth: CGFloat = 96
     static let minHeight: CGFloat = 24
+    static let signatureDefaultWidth: CGFloat = 180
+    static let signatureMinWidth: CGFloat = 96
+    static let signatureMaxWidth: CGFloat = 260
+    static let signatureContentPrefix = "__HYEON_SIG__:"
 
     static func font() -> NSFont {
         NSFont.systemFont(ofSize: fontSize, weight: .regular)
@@ -63,6 +82,28 @@ private enum StampStyle {
         return CGRect(x: originX, y: originY, width: width, height: height)
     }
 
+    static func bounds(forSignatureImage image: NSImage, at point: CGPoint, within pageBounds: CGRect) -> CGRect {
+        let imageSize = image.size
+        let aspectRatio: CGFloat
+        if imageSize.width > 0, imageSize.height > 0 {
+            aspectRatio = imageSize.height / imageSize.width
+        } else {
+            aspectRatio = 0.32
+        }
+
+        let maxAllowedWidth = max(signatureMinWidth, min(signatureMaxWidth, pageBounds.width))
+        let targetWidth = min(max(signatureDefaultWidth, signatureMinWidth), maxAllowedWidth)
+        let rawHeight = targetWidth * aspectRatio
+        let targetHeight = min(max(rawHeight, minHeight), max(pageBounds.height * 0.7, minHeight))
+
+        let maxX = max(pageBounds.minX, pageBounds.maxX - targetWidth)
+        let maxY = max(pageBounds.minY, pageBounds.maxY - targetHeight)
+        let originX = min(max(point.x, pageBounds.minX), maxX)
+        let originY = min(max(point.y - targetHeight, pageBounds.minY), maxY)
+
+        return CGRect(x: originX, y: originY, width: targetWidth, height: targetHeight)
+    }
+
     static func movedBounds(
         for annotation: PDFAnnotation,
         anchorPoint: CGPoint,
@@ -82,10 +123,79 @@ private enum StampStyle {
             return true
         }
 
+        if let contents = annotation.contents,
+           contents.hasPrefix(signatureContentPrefix) {
+            return true
+        }
+
+        // Backward compatibility for early signature-image stamps.
+        if annotation.type == PDFAnnotationSubtype.stamp.rawValue,
+           annotation.isReadOnly {
+            return true
+        }
+
         // Backward compatibility for stamps created before marker support.
         let isLegacyFreeText = annotation.type == PDFAnnotationSubtype.freeText.rawValue
         let hasTransparentBackground = annotation.color.alphaComponent <= 0.01
         return isLegacyFreeText && annotation.isReadOnly && hasTransparentBackground
+    }
+
+    static func signatureContents(from imageData: Data) -> String {
+        signatureContentPrefix + imageData.base64EncodedString()
+    }
+
+    static func signatureImageData(from annotation: PDFAnnotation) -> Data? {
+        guard let contents = annotation.contents,
+              contents.hasPrefix(signatureContentPrefix) else {
+            return nil
+        }
+        let encoded = String(contents.dropFirst(signatureContentPrefix.count))
+        return Data(base64Encoded: encoded)
+    }
+}
+
+final class SignatureImageAnnotation: PDFAnnotation {
+    private var cachedImage: NSImage?
+
+    convenience init(bounds: CGRect, imageData: Data) {
+        self.init(bounds: bounds, forType: .square, withProperties: nil)
+        applySignatureImageData(imageData)
+        isReadOnly = true
+        shouldPrint = true
+        color = .clear
+        let border = PDFBorder()
+        border.lineWidth = 0
+        self.border = border
+        _ = setValue(StampStyle.subject, forAnnotationKey: StampStyle.markerKey)
+    }
+
+    func applySignatureImageData(_ imageData: Data) {
+        contents = StampStyle.signatureContents(from: imageData)
+        cachedImage = NSImage(data: imageData)
+    }
+
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        let image: NSImage?
+        if let cachedImage {
+            image = cachedImage
+        } else if let imageData = StampStyle.signatureImageData(from: self) {
+            image = NSImage(data: imageData)
+        } else {
+            image = nil
+        }
+
+        guard let image else {
+            super.draw(with: box, in: context)
+            return
+        }
+
+        context.saveGState()
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        image.draw(in: bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        context.restoreGState()
     }
 }
 
@@ -113,6 +223,8 @@ private enum PersistedKeys {
     static let isFocusMode = "isFocusMode"
     static let searchQuery = "searchQuery"
     static let signerName = "signerName"
+    static let signatureImageData = "signatureImageData"
+    static let signatureImageName = "signatureImageName"
     static let windowFrame = "windowFrame"
 }
 
@@ -308,12 +420,35 @@ struct ViewerCommands: Commands {
             .keyboardShortcut("d", modifiers: [.command, .option])
             .disabled(!model.hasDocument)
 
+            Button("Import Signature...") {
+                model.importSignaturePNG()
+            }
+            .keyboardShortcut("i", modifiers: [.command, .option])
+
+            Button("Stamp Signature") {
+                model.queueSignatureStamp()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            .disabled(!model.hasDocument || model.signatureImageData == nil)
+
             Divider()
 
             Button("Cancel Stamp") {
                 model.cancelStampPlacement()
             }
             .disabled(model.pendingStamp == nil)
+
+            Button("Larger Stamp") {
+                model.requestResizeSelectedStampLarger()
+            }
+            .keyboardShortcut("]", modifiers: [.command, .option])
+            .disabled(!model.hasSelectedStamp)
+
+            Button("Smaller Stamp") {
+                model.requestResizeSelectedStampSmaller()
+            }
+            .keyboardShortcut("[", modifiers: [.command, .option])
+            .disabled(!model.hasSelectedStamp)
 
             Button("Delete Selected Stamp") {
                 model.requestDeleteSelectedStamp()
@@ -409,10 +544,31 @@ final class PDFDocumentModel: ObservableObject {
     @Published var searchRequest: SearchRequest?
     @Published var zoomRequest: ZoomRequest?
     @Published var deleteSelectedStampRequest: UUID?
+    @Published var resizeSelectedStampRequest: StampResizeRequest?
     @Published var pendingStamp: PendingStamp?
     @Published var hasSelectedStamp = false
     @Published var searchStatus: String?
     @Published var hasUnsavedChanges = false
+    @Published var signatureImageData: Data? {
+        didSet {
+            if let signatureImageData {
+                defaults.set(signatureImageData, forKey: PersistedKeys.signatureImageData)
+            } else {
+                defaults.removeObject(forKey: PersistedKeys.signatureImageData)
+                signatureImageName = nil
+            }
+        }
+    }
+    @Published var signatureImageName: String? {
+        didSet {
+            if let signatureImageName,
+               !signatureImageName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                defaults.set(signatureImageName, forKey: PersistedKeys.signatureImageName)
+            } else {
+                defaults.removeObject(forKey: PersistedKeys.signatureImageName)
+            }
+        }
+    }
     @Published var showsThumbnails = false {
         didSet {
             defaults.set(showsThumbnails, forKey: PersistedKeys.showsThumbnails)
@@ -483,6 +639,7 @@ final class PDFDocumentModel: ObservableObject {
            !storedSignerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             signerName = storedSignerName
         }
+        restorePersistedSignatureIfPossible()
         restoreLastDocumentIfPossible()
     }
 
@@ -637,7 +794,7 @@ final class PDFDocumentModel: ObservableObject {
             return
         }
 
-        pendingStamp = PendingStamp(text: trimmedName)
+        pendingStamp = PendingStamp(content: .text(trimmedName))
         searchStatus = "Move cursor to position the dashed preview, then click to place the name."
     }
 
@@ -647,8 +804,47 @@ final class PDFDocumentModel: ObservableObject {
         }
 
         let dateText = Self.stampDateFormatter.string(from: Date())
-        pendingStamp = PendingStamp(text: dateText)
+        pendingStamp = PendingStamp(content: .text(dateText))
         searchStatus = "Move cursor to position the dashed preview, then click to place the date."
+    }
+
+    func importSignaturePNG() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.title = "Import Signature PNG"
+
+        guard panel.runModal() == .OK, let selectedURL = panel.url else {
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: selectedURL, options: [.mappedIfSafe])
+            guard NSImage(data: data) != nil else {
+                searchStatus = "That file is not a valid PNG image."
+                return
+            }
+            signatureImageData = data
+            signatureImageName = selectedURL.lastPathComponent
+            searchStatus = "Signature imported. Use Stamp Signature to place it."
+        } catch {
+            searchStatus = "Could not import signature PNG."
+        }
+    }
+
+    func queueSignatureStamp() {
+        guard hasDocument else {
+            return
+        }
+
+        guard let signatureImageData else {
+            searchStatus = "Import a signature PNG first."
+            return
+        }
+
+        pendingStamp = PendingStamp(content: .signatureImage(signatureImageData))
+        searchStatus = "Move cursor to position the dashed preview, then click to place the signature."
     }
 
     func cancelStampPlacement() {
@@ -660,6 +856,20 @@ final class PDFDocumentModel: ObservableObject {
             return
         }
         deleteSelectedStampRequest = UUID()
+    }
+
+    func requestResizeSelectedStampLarger() {
+        guard hasDocument else {
+            return
+        }
+        resizeSelectedStampRequest = StampResizeRequest(action: .larger)
+    }
+
+    func requestResizeSelectedStampSmaller() {
+        guard hasDocument else {
+            return
+        }
+        resizeSelectedStampRequest = StampResizeRequest(action: .smaller)
     }
 
     @discardableResult
@@ -727,6 +937,26 @@ final class PDFDocumentModel: ObservableObject {
         }
 
         searchRequest = SearchRequest(query: trimmed, direction: direction)
+    }
+
+    private func restorePersistedSignatureIfPossible() {
+        guard let storedSignatureData = defaults.data(forKey: PersistedKeys.signatureImageData) else {
+            return
+        }
+
+        guard NSImage(data: storedSignatureData) != nil else {
+            defaults.removeObject(forKey: PersistedKeys.signatureImageData)
+            defaults.removeObject(forKey: PersistedKeys.signatureImageName)
+            return
+        }
+
+        signatureImageData = storedSignatureData
+        if let storedSignatureName = defaults.string(forKey: PersistedKeys.signatureImageName),
+           !storedSignatureName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signatureImageName = storedSignatureName
+        } else {
+            signatureImageName = "Signature.png"
+        }
     }
 
     private func triggerZoom(_ action: ZoomAction) {
@@ -1043,9 +1273,16 @@ struct ContentView: View {
                                 .disabled(!model.hasDocument)
                             Button("Stamp Date", action: model.queueDateStamp)
                                 .disabled(!model.hasDocument)
+                            Button("Import Signature...", action: model.importSignaturePNG)
+                            Button("Stamp Signature", action: model.queueSignatureStamp)
+                                .disabled(!model.hasDocument || model.signatureImageData == nil)
                             Divider()
                             Button("Cancel Stamp", action: model.cancelStampPlacement)
                                 .disabled(model.pendingStamp == nil)
+                            Button("Larger Stamp", action: model.requestResizeSelectedStampLarger)
+                                .disabled(!model.hasSelectedStamp)
+                            Button("Smaller Stamp", action: model.requestResizeSelectedStampSmaller)
+                                .disabled(!model.hasSelectedStamp)
                             Button("Delete Selected Stamp", action: model.requestDeleteSelectedStamp)
                                 .disabled(!model.hasSelectedStamp)
                         }
@@ -1082,7 +1319,12 @@ struct ContentView: View {
                         if model.hasDocument {
                             HStack(spacing: 10) {
                                 if let stamp = model.pendingStamp {
-                                    Text("Click to place: \(stamp.text)")
+                                    Text("Click to place: \(pendingStampLabel(stamp))")
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                if let signatureName = model.signatureImageName {
+                                    Text("Signature: \(signatureName)")
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
                                 }
@@ -1117,6 +1359,7 @@ struct ContentView: View {
                     searchRequest: model.searchRequest,
                     zoomRequest: model.zoomRequest,
                     deleteSelectedStampRequest: model.deleteSelectedStampRequest,
+                    resizeSelectedStampRequest: model.resizeSelectedStampRequest,
                     pendingStamp: $model.pendingStamp,
                     hasSelectedStamp: $model.hasSelectedStamp,
                     hasUnsavedChanges: $model.hasUnsavedChanges,
@@ -1153,6 +1396,15 @@ struct ContentView: View {
             }
         }
     }
+
+    private func pendingStampLabel(_ stamp: PendingStamp) -> String {
+        switch stamp.content {
+        case .text(let text):
+            return text
+        case .signatureImage:
+            return "Signature"
+        }
+    }
 }
 
 struct WindowAccessor: NSViewRepresentable {
@@ -1187,6 +1439,7 @@ struct PDFKitView: NSViewRepresentable {
     let searchRequest: SearchRequest?
     let zoomRequest: ZoomRequest?
     let deleteSelectedStampRequest: UUID?
+    let resizeSelectedStampRequest: StampResizeRequest?
     @Binding var pendingStamp: PendingStamp?
     @Binding var hasSelectedStamp: Bool
     @Binding var hasUnsavedChanges: Bool
@@ -1203,6 +1456,7 @@ struct PDFKitView: NSViewRepresentable {
         final class StampOverlayView: NSView {
             var previewRectInView: CGRect?
             var previewText = ""
+            var previewImage: NSImage?
             var selectedRectInView: CGRect?
 
             override func hitTest(_ point: NSPoint) -> NSView? {
@@ -1216,6 +1470,7 @@ struct PDFKitView: NSViewRepresentable {
                     drawOverlay(
                         in: previewRectInView,
                         text: previewText,
+                        image: previewImage,
                         strokeColor: NSColor.systemBlue.withAlphaComponent(0.9),
                         fillColor: NSColor.systemBlue.withAlphaComponent(0.08),
                         textColor: NSColor.systemBlue.withAlphaComponent(0.9),
@@ -1227,6 +1482,7 @@ struct PDFKitView: NSViewRepresentable {
                     drawOverlay(
                         in: selectedRectInView,
                         text: nil,
+                        image: nil,
                         strokeColor: NSColor.systemOrange.withAlphaComponent(0.9),
                         fillColor: .clear,
                         textColor: nil,
@@ -1238,6 +1494,7 @@ struct PDFKitView: NSViewRepresentable {
             private func drawOverlay(
                 in rect: CGRect,
                 text: String?,
+                image: NSImage?,
                 strokeColor: NSColor,
                 fillColor: NSColor,
                 textColor: NSColor?,
@@ -1259,6 +1516,18 @@ struct PDFKitView: NSViewRepresentable {
                 roundedRect.lineWidth = 1.5
                 roundedRect.stroke()
 
+                if let image {
+                    let imageRect = rect.insetBy(dx: 2, dy: 2)
+                    image.draw(
+                        in: imageRect,
+                        from: .zero,
+                        operation: .sourceOver,
+                        fraction: 0.75,
+                        respectFlipped: true,
+                        hints: nil
+                    )
+                }
+
                 if let text, let textColor {
                     let textRect = rect.insetBy(dx: StampStyle.horizontalPadding, dy: StampStyle.verticalPadding)
                     let attributes: [NSAttributedString.Key: Any] = [
@@ -1273,11 +1542,12 @@ struct PDFKitView: NSViewRepresentable {
         var onPageClick: ((PDFPage, CGPoint) -> Bool)?
         var onStampEdited: ((StampEditAction) -> Void)?
         var onStampSelectionChanged: ((Bool) -> Void)?
-        var pendingStampText: String? {
+        var pendingStamp: PendingStamp? {
             didSet {
-                if pendingStampText == nil {
+                if pendingStamp == nil {
                     previewRectInView = nil
                     previewText = ""
+                    previewImage = nil
                     stopPreviewRefreshTimer()
                 } else {
                     startPreviewRefreshTimer()
@@ -1290,6 +1560,7 @@ struct PDFKitView: NSViewRepresentable {
         private var cursorTrackingArea: NSTrackingArea?
         private var previewRectInView: CGRect?
         private var previewText = ""
+        private var previewImage: NSImage?
         private weak var selectedStampPage: PDFPage?
         private var selectedStampAnnotation: PDFAnnotation?
         private var isDraggingStamp = false
@@ -1339,16 +1610,17 @@ struct PDFKitView: NSViewRepresentable {
             if let page = page(for: pointInView, nearest: true) {
                 let pagePoint = convert(pointInView, to: page)
 
-                if pendingStampText != nil,
+                if pendingStamp != nil,
                    onPageClick?(page, pagePoint) == true {
                     previewRectInView = nil
                     previewText = ""
+                    previewImage = nil
                     clearStampSelection()
                     refreshOverlay()
                     return
                 }
 
-                if pendingStampText == nil,
+                if pendingStamp == nil,
                    let annotation = managedAnnotation(on: page, at: pagePoint) {
                     selectStamp(annotation, on: page)
                     dragOffset = CGPoint(
@@ -1428,6 +1700,53 @@ struct PDFKitView: NSViewRepresentable {
             return true
         }
 
+        @discardableResult
+        func resizeSelectedStamp(scaleFactor: CGFloat) -> Bool {
+            guard let page = selectedStampPage,
+                  let annotation = selectedStampAnnotation else {
+                return false
+            }
+
+            let currentBounds = annotation.bounds
+            guard currentBounds.width > 0, currentBounds.height > 0 else {
+                return false
+            }
+
+            let pageBounds = page.bounds(for: displayBox)
+            let minWidth: CGFloat = 28
+            let minHeight: CGFloat = 18
+            let targetWidth = min(max(currentBounds.width * scaleFactor, minWidth), pageBounds.width)
+            let targetHeight = min(max(currentBounds.height * scaleFactor, minHeight), pageBounds.height)
+
+            var resizedBounds = CGRect(
+                x: currentBounds.midX - (targetWidth / 2),
+                y: currentBounds.midY - (targetHeight / 2),
+                width: targetWidth,
+                height: targetHeight
+            )
+
+            if resizedBounds.minX < pageBounds.minX {
+                resizedBounds.origin.x = pageBounds.minX
+            }
+            if resizedBounds.minY < pageBounds.minY {
+                resizedBounds.origin.y = pageBounds.minY
+            }
+            if resizedBounds.maxX > pageBounds.maxX {
+                resizedBounds.origin.x = pageBounds.maxX - resizedBounds.width
+            }
+            if resizedBounds.maxY > pageBounds.maxY {
+                resizedBounds.origin.y = pageBounds.maxY - resizedBounds.height
+            }
+
+            guard resizedBounds != currentBounds else {
+                return false
+            }
+
+            annotation.bounds = resizedBounds
+            refreshOverlay()
+            return true
+        }
+
         override func updateTrackingAreas() {
             super.updateTrackingAreas()
 
@@ -1446,7 +1765,7 @@ struct PDFKitView: NSViewRepresentable {
         }
 
         override func mouseMoved(with event: NSEvent) {
-            guard pendingStampText != nil else {
+            guard pendingStamp != nil else {
                 return
             }
             let pointInView = convert(event.locationInWindow, from: nil)
@@ -1454,16 +1773,17 @@ struct PDFKitView: NSViewRepresentable {
         }
 
         override func mouseExited(with event: NSEvent) {
-            guard pendingStampText != nil else {
+            guard pendingStamp != nil else {
                 return
             }
             previewRectInView = nil
             previewText = ""
+            previewImage = nil
             refreshOverlay()
         }
 
         private func refreshPreviewAtCurrentMouseLocation() {
-            guard let window, pendingStampText != nil else {
+            guard let window, pendingStamp != nil else {
                 return
             }
             let pointInView = convert(window.mouseLocationOutsideOfEventStream, from: nil)
@@ -1471,9 +1791,10 @@ struct PDFKitView: NSViewRepresentable {
         }
 
         private func updatePreview(at pointInView: CGPoint) {
-            guard let stampText = pendingStampText else {
+            guard let pendingStamp else {
                 previewRectInView = nil
                 previewText = ""
+                previewImage = nil
                 refreshOverlay()
                 return
             }
@@ -1481,6 +1802,7 @@ struct PDFKitView: NSViewRepresentable {
             guard bounds.contains(pointInView) else {
                 previewRectInView = nil
                 previewText = ""
+                previewImage = nil
                 refreshOverlay()
                 return
             }
@@ -1488,15 +1810,32 @@ struct PDFKitView: NSViewRepresentable {
             guard let page = page(for: pointInView, nearest: true) else {
                 previewRectInView = nil
                 previewText = ""
+                previewImage = nil
                 refreshOverlay()
                 return
             }
 
             let pagePoint = convert(pointInView, to: page)
             let pageBounds = page.bounds(for: displayBox)
-            let rectOnPage = StampStyle.bounds(for: stampText, at: pagePoint, within: pageBounds)
-            previewRectInView = convert(rectOnPage, from: page)
-            previewText = stampText
+            switch pendingStamp.content {
+            case .text(let stampText):
+                let rectOnPage = StampStyle.bounds(for: stampText, at: pagePoint, within: pageBounds)
+                previewRectInView = convert(rectOnPage, from: page)
+                previewText = stampText
+                previewImage = nil
+            case .signatureImage(let imageData):
+                guard let image = NSImage(data: imageData) else {
+                    previewRectInView = nil
+                    previewText = ""
+                    previewImage = nil
+                    refreshOverlay()
+                    return
+                }
+                let rectOnPage = StampStyle.bounds(forSignatureImage: image, at: pagePoint, within: pageBounds)
+                previewRectInView = convert(rectOnPage, from: page)
+                previewText = ""
+                previewImage = image
+            }
             refreshOverlay()
         }
 
@@ -1510,7 +1849,7 @@ struct PDFKitView: NSViewRepresentable {
                 matching: [.mouseMoved, .leftMouseDragged]
             ) { [weak self] event in
                 guard let self,
-                      self.pendingStampText != nil,
+                      self.pendingStamp != nil,
                       let window = self.window,
                       event.window === window else {
                     return event
@@ -1595,6 +1934,7 @@ struct PDFKitView: NSViewRepresentable {
             ensureOverlayInstalled()
             overlayView.previewRectInView = previewRectInView
             overlayView.previewText = previewText
+            overlayView.previewImage = previewImage
             overlayView.selectedRectInView = selectedStampRectInView()
             overlayView.needsDisplay = true
         }
@@ -1615,7 +1955,7 @@ struct PDFKitView: NSViewRepresentable {
         workspace.pdfView.minScaleFactor = 0.25
         workspace.pdfView.maxScaleFactor = 8.0
         workspace.pdfView.document = document
-        workspace.pdfView.pendingStampText = pendingStamp?.text
+        workspace.pdfView.pendingStamp = pendingStamp
         workspace.thumbnailView.pdfView = workspace.pdfView
         workspace.setThumbnailsVisible(showsThumbnails, preferredWidth: thumbnailPaneWidth)
         let coordinator = context.coordinator
@@ -1662,7 +2002,7 @@ struct PDFKitView: NSViewRepresentable {
             nsView.thumbnailView.pdfView = nsView.pdfView
             context.coordinator.resetSearchState()
         }
-        nsView.pdfView.pendingStampText = pendingStamp?.text
+        nsView.pdfView.pendingStamp = pendingStamp
 
         nsView.setThumbnailsVisible(showsThumbnails, preferredWidth: thumbnailPaneWidth)
 
@@ -1689,6 +2029,12 @@ struct PDFKitView: NSViewRepresentable {
            context.coordinator.lastHandledDeleteStampID != deleteRequest {
             context.coordinator.lastHandledDeleteStampID = deleteRequest
             context.coordinator.deleteSelectedStamp(in: nsView.pdfView)
+        }
+
+        if let resizeRequest = resizeSelectedStampRequest,
+           context.coordinator.lastHandledResizeStampID != resizeRequest.id {
+            context.coordinator.lastHandledResizeStampID = resizeRequest.id
+            context.coordinator.resizeSelectedStamp(resizeRequest.action, in: nsView.pdfView)
         }
     }
 
@@ -1908,6 +2254,7 @@ extension PDFKitView {
         var lastHandledSearchID: UUID?
         var lastHandledZoomID: UUID?
         var lastHandledDeleteStampID: UUID?
+        var lastHandledResizeStampID: UUID?
         var hasAppliedInitialZoom = false
 
         init(_ parent: PDFKitView) {
@@ -1935,7 +2282,7 @@ extension PDFKitView {
         func handleStampSelectionChanged(_ isSelected: Bool) {
             parent.hasSelectedStamp = isSelected
             if isSelected {
-                parent.searchStatus = "Stamp selected. Drag to move or click Delete Stamp."
+                parent.searchStatus = "Stamp selected. Drag to move, Option+Cmd+[ or ] to resize, Delete to remove."
             }
         }
 
@@ -1949,12 +2296,39 @@ extension PDFKitView {
             }
         }
 
+        func resizeSelectedStamp(_ action: StampResizeAction, in pdfView: InteractivePDFView) {
+            let scale: CGFloat
+            switch action {
+            case .larger:
+                scale = 1.12
+            case .smaller:
+                scale = 0.88
+            }
+
+            if pdfView.resizeSelectedStamp(scaleFactor: scale) {
+                parent.hasUnsavedChanges = true
+                parent.searchStatus = "Stamp resized."
+            } else {
+                parent.searchStatus = "Select a stamp first."
+            }
+        }
+
         func handlePageClick(on page: PDFPage, at point: CGPoint, pdfView: PDFView) -> Bool {
             guard let pendingStamp = parent.pendingStamp else {
                 return false
             }
 
-            addStampAnnotation(text: pendingStamp.text, on: page, at: point, pdfView: pdfView)
+            switch pendingStamp.content {
+            case .text(let text):
+                addStampAnnotation(text: text, on: page, at: point, pdfView: pdfView)
+            case .signatureImage(let imageData):
+                guard let image = NSImage(data: imageData) else {
+                    parent.searchStatus = "Signature image is invalid. Import PNG again."
+                    parent.pendingStamp = nil
+                    return false
+                }
+                addSignatureAnnotation(image: image, on: page, at: point, pdfView: pdfView)
+            }
             parent.pendingStamp = nil
             parent.hasSelectedStamp = false
             parent.hasUnsavedChanges = true
@@ -1968,6 +2342,7 @@ extension PDFKitView {
             lastHandledSearchID = nil
             lastHandledZoomID = nil
             lastHandledDeleteStampID = nil
+            lastHandledResizeStampID = nil
             parent.hasSelectedStamp = false
             hasAppliedInitialZoom = false
         }
@@ -2085,6 +2460,20 @@ extension PDFKitView {
             annotation.isReadOnly = true
             annotation.shouldPrint = true
             annotation.setValue(StampStyle.subject, forAnnotationKey: StampStyle.markerKey)
+            page.addAnnotation(annotation)
+        }
+
+        private func addSignatureAnnotation(image: NSImage, on page: PDFPage, at point: CGPoint, pdfView: PDFView) {
+            let pageBounds = page.bounds(for: pdfView.displayBox)
+            let bounds = StampStyle.bounds(forSignatureImage: image, at: point, within: pageBounds)
+            guard let tiffData = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiffData),
+                  let pngData = bitmap.representation(using: .png, properties: [:]) else {
+                parent.searchStatus = "Could not encode signature image."
+                return
+            }
+
+            let annotation = SignatureImageAnnotation(bounds: bounds, imageData: pngData)
             page.addAnnotation(annotation)
         }
 
