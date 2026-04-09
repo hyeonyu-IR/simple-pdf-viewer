@@ -12,12 +12,14 @@ BIN_PATH="${ROOT_DIR}/.build/release/${EXECUTABLE_NAME}"
 PLIST_PATH="${APP_DIR}/Contents/Info.plist"
 VERSION_FILE="${ROOT_DIR}/VERSION"
 DEFAULT_APP_VERSION="1.0.0"
-DEFAULT_ICON_SOURCE_PATH="${ROOT_DIR}/assets/AppIcon.icns"
+DEFAULT_ICON_ICNS_SOURCE_PATH="${ROOT_DIR}/assets/AppIcon.icns"
+DEFAULT_ICON_IMAGE_SOURCE_PATH="${ROOT_DIR}/pdf-viewer-converted.png"
 APP_VERSION_ARG=""
 APP_BUILD_ARG=""
 ICON_SOURCE_PATH_ARG=""
 ICON_BUNDLE_NAME="AppIcon.icns"
 ICON_PLIST_ENTRY=""
+USES_CUSTOM_BUNDLE_ICON=false
 
 usage() {
   cat <<'EOF'
@@ -32,8 +34,29 @@ Options:
 Environment:
   APP_VERSION          Same as --version
   APP_BUILD            Same as --build
-  APP_ICON_PATH        Same as --icon
+  APP_ICON_PATH        Same as --icon (supports .icns or image files like .png)
 EOF
+}
+
+apply_custom_bundle_icon() {
+  local source_image="$1"
+  local app_path="$2"
+  local temp_png
+  local temp_rsrc
+  local icon_file
+
+  temp_png="$(mktemp "${TMPDIR:-/tmp}/appicon.XXXXXX.png")"
+  temp_rsrc="$(mktemp "${TMPDIR:-/tmp}/appicon.XXXXXX.rsrc")"
+  icon_file="${app_path}/Icon"$'\r'
+
+  trap 'rm -f "${temp_png}" "${temp_rsrc}"' RETURN
+
+  sips -s format png "${source_image}" --out "${temp_png}" >/dev/null
+  sips -i "${temp_png}" >/dev/null
+  DeRez -only icns "${temp_png}" > "${temp_rsrc}"
+  rm -f "${icon_file}"
+  Rez -append "${temp_rsrc}" -o "${icon_file}"
+  SetFile -a C "${app_path}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -88,7 +111,15 @@ if [[ -z "${APP_BUILD_DEFAULT}" ]]; then
   APP_BUILD_DEFAULT="1"
 fi
 APP_BUILD="${APP_BUILD_ARG:-${APP_BUILD:-${APP_BUILD_DEFAULT}}}"
-ICON_SOURCE_PATH="${ICON_SOURCE_PATH_ARG:-${APP_ICON_PATH:-${DEFAULT_ICON_SOURCE_PATH}}}"
+ICON_SOURCE_PATH="${ICON_SOURCE_PATH_ARG:-${APP_ICON_PATH:-}}"
+
+if [[ -z "${ICON_SOURCE_PATH}" ]]; then
+  if [[ -f "${DEFAULT_ICON_ICNS_SOURCE_PATH}" ]]; then
+    ICON_SOURCE_PATH="${DEFAULT_ICON_ICNS_SOURCE_PATH}"
+  elif [[ -f "${DEFAULT_ICON_IMAGE_SOURCE_PATH}" ]]; then
+    ICON_SOURCE_PATH="${DEFAULT_ICON_IMAGE_SOURCE_PATH}"
+  fi
+fi
 
 if [[ -n "${ICON_SOURCE_PATH}" && "${ICON_SOURCE_PATH}" != /* ]]; then
   ICON_SOURCE_PATH="${ROOT_DIR}/${ICON_SOURCE_PATH}"
@@ -107,14 +138,18 @@ rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${EXECUTABLE_NAME}"
 
-if [[ -f "${ICON_SOURCE_PATH}" ]]; then
+if [[ -f "${ICON_SOURCE_PATH}" && "${ICON_SOURCE_PATH##*.}" == "icns" ]]; then
   cp "${ICON_SOURCE_PATH}" "${APP_DIR}/Contents/Resources/${ICON_BUNDLE_NAME}"
   ICON_PLIST_ENTRY=$(cat <<EOF
   <key>CFBundleIconFile</key>
   <string>${ICON_BUNDLE_NAME}</string>
 EOF
 )
-  echo "Using custom icon: ${ICON_SOURCE_PATH}"
+  echo "Using custom .icns icon: ${ICON_SOURCE_PATH}"
+elif [[ -f "${ICON_SOURCE_PATH}" ]]; then
+  apply_custom_bundle_icon "${ICON_SOURCE_PATH}" "${APP_DIR}"
+  USES_CUSTOM_BUNDLE_ICON=true
+  echo "Using custom bundle icon image: ${ICON_SOURCE_PATH}"
 else
   echo "No custom icon found at ${ICON_SOURCE_PATH} (using default app icon)."
 fi
@@ -165,8 +200,12 @@ ${ICON_PLIST_ENTRY}
 EOF
 
 echo "Bundle version: ${APP_VERSION} (${APP_BUILD})"
-echo "Ad-hoc signing app bundle..."
-codesign --force --deep --sign - "${APP_DIR}" >/dev/null
+if [[ "${USES_CUSTOM_BUNDLE_ICON}" == "true" ]]; then
+  echo "Skipping ad-hoc signing because custom bundle icons add Finder metadata that codesign rejects."
+else
+  echo "Ad-hoc signing app bundle..."
+  codesign --force --deep --sign - "${APP_DIR}" >/dev/null
+fi
 
 echo "Done."
 echo "App bundle: ${APP_DIR}"

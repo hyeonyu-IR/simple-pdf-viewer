@@ -117,7 +117,7 @@ fi
 echo "Installing app to ${INSTALL_PATH}..."
 run_install_cmd mkdir -p "${INSTALL_ROOT}"
 run_install_cmd rm -rf "${INSTALL_PATH}"
-run_install_cmd cp -R "${APP_SOURCE}" "${INSTALL_PATH}"
+run_install_cmd ditto "${APP_SOURCE}" "${INSTALL_PATH}"
 run_install_cmd xattr -dr com.apple.quarantine "${INSTALL_PATH}" || true
 
 echo "Registering app with LaunchServices..."
