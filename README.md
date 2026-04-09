@@ -2,6 +2,8 @@
 
 Lightweight macOS PDF viewer built with SwiftUI + PDFKit.
 
+This app is designed for people who mainly want to view PDF files and quickly add simple document marks such as a signature or date for office-style paperwork. It is intentionally lightweight and focused, without trying to include too many extra editing functions.
+
 ## Features
 - Open a local PDF file
 - View pages with native PDF rendering
