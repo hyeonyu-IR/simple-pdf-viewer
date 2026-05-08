@@ -6,24 +6,29 @@ This app is designed for people who mainly want to view PDF files and quickly ad
 
 ## Features
 - Open a local PDF file
+- Close the current PDF without quitting the app
 - View pages with native PDF rendering
 - Previous / Next page navigation
 - Live page indicator
 - Text search (next/previous with wrap)
-- Thumbnail sidebar toggle
+- File menu in the top toolbar with `Open PDF...`, `Save`, `Save As...`, and `Close PDF`
+- Thumbnail sidebar toggle with draggable width and persisted size
+- Right-side keyboard shortcuts panel with toggle, draggable width, and persisted size
 - Session restore: last PDF, last page, sidebar/search state, and window frame
 - Keyboard shortcuts: `Cmd+F`, `Cmd+G`, `Shift+Cmd+G`
 - Zoom controls (`Cmd+=`, `Cmd+-`, `Cmd+0`, fit width/page)
-- Draggable thumbnail pane width with persistence
+- Smaller keyboard zoom step for finer control
 - Distraction-free focus mode (`Shift+Cmd+F`)
-- Zoom state persistence across relaunch
+- Zoom state persistence per document across relaunch
 - Recent files (last 10): `File > Open Recent`
-- In-app shortcut cheat sheet: `Help > Keyboard Shortcuts`
+- In-app shortcut cheat sheet: both `Help > Keyboard Shortcuts` and the right-side shortcuts panel
 - Lightweight text stamps: `Stamp Name`, `Stamp Date`, dashed placement preview, then click page to place
 - PNG signature stamp: import a `.png` signature once, then place it with dashed preview (persists across relaunch)
 - Move a placed stamp by dragging; resize selected stamp larger/smaller; delete selected stamp with `Delete` or `Delete Stamp` button
+- Text-stamp resizing changes the actual text size, not just the annotation bounds
 - Save edited PDFs (`Cmd+S`) and save-as (`Shift+Cmd+S`)
-- Unsaved-change prompt when opening another PDF or closing window
+- Visible saved/modified indicator for the current document
+- Unsaved-change prompt when opening another PDF, closing the PDF, closing the window, or quitting the app
 
 ## Keyboard Shortcuts
 - `Cmd+O`: Open PDF
@@ -43,6 +48,13 @@ This app is designed for people who mainly want to view PDF files and quickly ad
 - `Option+Cmd+]`: Larger selected stamp
 - `Option+Cmd+[`: Smaller selected stamp
 - `Delete`: Delete selected stamp
+
+## Interface Notes
+- `Thumbnail` toggles the left page-strip panel.
+- `Shortcuts` toggles the right keyboard-shortcuts panel.
+- Both side panels can be resized by dragging their divider.
+- Focus mode hides the main toolbar and keeps only `Exit Focus` visible.
+- The current document name and `Saved` / `Modified` state appear in the status row.
 
 ## App Metadata
 - `Hyeon's PDF Viewer > About Hyeon's PDF Viewer` shows app name, version, build, and credits.
@@ -71,6 +83,12 @@ This creates:
 You can launch it without Xcode:
 ```bash
 open "dist/Hyeon's PDF Viewer.app"
+```
+
+For a quick local build check without packaging:
+```bash
+cd /Users/hyeonyu/Documents/miniconda_medimg_env/simple-pdf-viewer
+swift build
 ```
 
 ## One-Command Install (Default PDF App)
@@ -116,3 +134,4 @@ You can also provide an icon path explicitly with `--icon` or `APP_ICON_PATH`, u
 - This project is a Swift Package executable app targeting macOS 13+.
 - If command-line `swift build` fails due local toolchain mismatch, run from Xcode with the active macOS SDK/toolchain.
 - You can use the same repo and `./scripts/install.sh --clean-pdf-overrides` on another Mac (for example your Mac mini).
+- Git pushes from this Mac are configured to work best over SSH for this repository.
