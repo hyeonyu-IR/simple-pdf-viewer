@@ -2,6 +2,8 @@
 
 Lightweight macOS PDF viewer built with SwiftUI + PDFKit.
 
+This app is designed for people who mainly want to view PDF files and quickly add simple document marks such as a signature or date for office-style paperwork. It is intentionally lightweight and focused, without trying to include too many extra editing functions.
+
 ## Features
 - Open a local PDF file
 - View pages with native PDF rendering
@@ -16,6 +18,7 @@ Lightweight macOS PDF viewer built with SwiftUI + PDFKit.
 - Distraction-free focus mode (`Shift+Cmd+F`)
 - Zoom state persistence across relaunch
 - Recent files (last 10): `File > Open Recent`
+- In-app shortcut cheat sheet: `Help > Keyboard Shortcuts`
 - Lightweight text stamps: `Stamp Name`, `Stamp Date`, dashed placement preview, then click page to place
 - PNG signature stamp: import a `.png` signature once, then place it with dashed preview (persists across relaunch)
 - Move a placed stamp by dragging; resize selected stamp larger/smaller; delete selected stamp with `Delete` or `Delete Stamp` button
@@ -89,18 +92,25 @@ Useful options:
 
 ## Set a Custom Dock Icon
 1. Prepare a square image (1024x1024 PNG recommended).
-2. Convert it to app icon format:
+2. If `pdf-viewer-converted.png` is present in the project folder, `package_app.sh` will use it automatically.
+3. Rebuild the app bundle:
+```bash
+cd /Users/hyeonyu/Documents/miniconda_medimg_env/simple-pdf-viewer
+./scripts/package_app.sh
+```
+
+Optional: convert a PNG to `.icns` explicitly:
 ```bash
 cd /Users/hyeonyu/Documents/miniconda_medimg_env/simple-pdf-viewer
 ./scripts/make_icon_icns.sh /path/to/your-icon.png assets/AppIcon.icns
 ```
-3. Rebuild the app bundle:
+Then rebuild:
 ```bash
 ./scripts/package_app.sh
 ```
 
 `package_app.sh` automatically embeds `assets/AppIcon.icns` if present.
-You can also provide an icon path explicitly with `--icon` or `APP_ICON_PATH`.
+You can also provide an icon path explicitly with `--icon` or `APP_ICON_PATH`, using either `.icns` or image files like `.png`.
 
 ## Notes
 - This project is a Swift Package executable app targeting macOS 13+.

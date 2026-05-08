@@ -50,7 +50,10 @@ struct PendingStamp: Equatable {
 private enum StampStyle {
     static let subject = "HyeonsPDFViewerStamp"
     static let markerKey = PDFAnnotationKey(rawValue: "HyeonsStampMarker")
+    static let fontSizeKey = PDFAnnotationKey(rawValue: "HyeonsStampFontSize")
     static let fontSize: CGFloat = 14
+    static let minFontSize: CGFloat = 8
+    static let maxFontSize: CGFloat = 72
     static let horizontalPadding: CGFloat = 10
     static let verticalPadding: CGFloat = 6
     static let minWidth: CGFloat = 96
@@ -60,25 +63,53 @@ private enum StampStyle {
     static let signatureMaxWidth: CGFloat = 260
     static let signatureContentPrefix = "__HYEON_SIG__:"
 
-    static func font() -> NSFont {
-        NSFont.systemFont(ofSize: fontSize, weight: .regular)
+    static func font(ofSize size: CGFloat = fontSize) -> NSFont {
+        NSFont.systemFont(ofSize: size, weight: .regular)
+    }
+
+    static func clampedFontSize(_ size: CGFloat) -> CGFloat {
+        min(max(size, minFontSize), maxFontSize)
+    }
+
+    static func textSize(for text: String, font: NSFont) -> CGSize {
+        (text as NSString).size(withAttributes: [.font: font])
+    }
+
+    static func fittedSize(for text: String, font: NSFont) -> CGSize {
+        let textSize = textSize(for: text, font: font)
+        return CGSize(
+            width: max(minWidth, textSize.width + (horizontalPadding * 2)),
+            height: max(minHeight, textSize.height + (verticalPadding * 2))
+        )
     }
 
     static func bounds(for text: String, at point: CGPoint, within pageBounds: CGRect) -> CGRect {
-        let textSize = (text as NSString).size(withAttributes: [.font: font()])
-        let width = min(
-            max(minWidth, textSize.width + (horizontalPadding * 2)),
-            max(pageBounds.width, minWidth)
-        )
-        let height = min(
-            max(minHeight, textSize.height + (verticalPadding * 2)),
-            max(pageBounds.height, minHeight)
-        )
+        let fittedSize = fittedSize(for: text, font: font())
+        let width = min(fittedSize.width, max(pageBounds.width, minWidth))
+        let height = min(fittedSize.height, max(pageBounds.height, minHeight))
 
         let maxX = max(pageBounds.minX, pageBounds.maxX - width)
         let maxY = max(pageBounds.minY, pageBounds.maxY - height)
         let originX = min(max(point.x, pageBounds.minX), maxX)
         let originY = min(max(point.y - height, pageBounds.minY), maxY)
+        return CGRect(x: originX, y: originY, width: width, height: height)
+    }
+
+    static func resizedTextBounds(
+        for text: String,
+        fontSize: CGFloat,
+        centeredAt center: CGPoint,
+        within pageBounds: CGRect
+    ) -> CGRect {
+        let fittedSize = fittedSize(for: text, font: font(ofSize: clampedFontSize(fontSize)))
+        let width = min(fittedSize.width, max(pageBounds.width, minWidth))
+        let height = min(fittedSize.height, max(pageBounds.height, minHeight))
+
+        var originX = center.x - (width / 2)
+        var originY = center.y - (height / 2)
+        originX = min(max(originX, pageBounds.minX), max(pageBounds.maxX - width, pageBounds.minX))
+        originY = min(max(originY, pageBounds.minY), max(pageBounds.maxY - height, pageBounds.minY))
+
         return CGRect(x: originX, y: originY, width: width, height: height)
     }
 
@@ -152,6 +183,31 @@ private enum StampStyle {
         let encoded = String(contents.dropFirst(signatureContentPrefix.count))
         return Data(base64Encoded: encoded)
     }
+
+    static func textContents(from annotation: PDFAnnotation) -> String? {
+        guard isManaged(annotation: annotation),
+              let contents = annotation.contents,
+              !contents.isEmpty,
+              !contents.hasPrefix(signatureContentPrefix) else {
+            return nil
+        }
+        return contents
+    }
+
+    static func storedFontSize(from annotation: PDFAnnotation) -> CGFloat {
+        if let number = annotation.value(forAnnotationKey: fontSizeKey) as? NSNumber {
+            return clampedFontSize(CGFloat(truncating: number))
+        }
+        if let string = annotation.value(forAnnotationKey: fontSizeKey) as? String,
+           let value = Double(string) {
+            return clampedFontSize(CGFloat(value))
+        }
+        if let font = annotation.font {
+            return clampedFontSize(font.pointSize)
+        }
+        return fontSize
+    }
+
 }
 
 final class SignatureImageAnnotation: PDFAnnotation {
@@ -199,6 +255,53 @@ final class SignatureImageAnnotation: PDFAnnotation {
     }
 }
 
+final class TextStampAnnotation: PDFAnnotation {
+    convenience init(bounds: CGRect, text: String, fontSize: CGFloat) {
+        self.init(bounds: bounds, forType: .square, withProperties: nil)
+        apply(text: text, fontSize: fontSize)
+        isReadOnly = true
+        shouldPrint = true
+        color = .clear
+        let border = PDFBorder()
+        border.lineWidth = 0
+        self.border = border
+        _ = setValue(StampStyle.subject, forAnnotationKey: StampStyle.markerKey)
+    }
+
+    func apply(text: String, fontSize: CGFloat) {
+        contents = text
+        let clampedSize = StampStyle.clampedFontSize(fontSize)
+        font = StampStyle.font(ofSize: clampedSize)
+        fontColor = .black
+        alignment = .left
+        color = .clear
+        _ = setValue(NSNumber(value: Double(clampedSize)), forAnnotationKey: StampStyle.fontSizeKey)
+    }
+
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        guard let text = contents, !text.isEmpty else {
+            return
+        }
+
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = alignment
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: StampStyle.font(ofSize: StampStyle.storedFontSize(from: self)),
+            .foregroundColor: fontColor ?? NSColor.black,
+            .paragraphStyle: paragraphStyle,
+        ]
+        let textRect = bounds.insetBy(dx: StampStyle.horizontalPadding, dy: StampStyle.verticalPadding)
+
+        context.saveGState()
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
+        NSGraphicsContext.restoreGraphicsState()
+        context.restoreGState()
+    }
+}
+
 struct RecentFileItem: Equatable, Identifiable {
     let url: URL
 
@@ -218,9 +321,12 @@ private enum PersistedKeys {
     static let recentFilePaths = "recentFilePaths"
     static let showsThumbnails = "showsThumbnails"
     static let thumbnailPaneWidth = "thumbnailPaneWidth"
+    static let keyboardShortcutsPanelWidth = "keyboardShortcutsPanelWidth"
     static let zoomScaleFactor = "zoomScaleFactor"
     static let zoomUsesAutoScale = "zoomUsesAutoScale"
+    static let documentZoomStates = "documentZoomStates"
     static let isFocusMode = "isFocusMode"
+    static let showsKeyboardShortcutsPanel = "showsKeyboardShortcutsPanel"
     static let searchQuery = "searchQuery"
     static let signerName = "signerName"
     static let signatureImageData = "signatureImageData"
@@ -279,6 +385,13 @@ final class AppFileOpenDelegate: NSObject, NSApplicationDelegate {
             self.enqueueIncomingFiles(urls)
             sender.reply(toOpenOrPrint: .success)
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else {
+            return .terminateNow
+        }
+        return model.confirmApplicationQuitIfNeeded() ? .terminateNow : .terminateCancel
     }
 
     private func enqueueIncomingFiles(_ urls: [URL]) {
@@ -372,6 +485,18 @@ struct ViewerCommands: Commands {
             Button("About Hyeon's PDF Viewer") {
                 model.showAboutPanel()
             }
+        }
+
+        CommandGroup(replacing: .newItem) {
+            Button("Open PDF...") {
+                model.openPanel()
+            }
+            .keyboardShortcut("o", modifiers: [.command])
+
+            Button("Close PDF") {
+                model.closeDocument()
+            }
+            .disabled(!model.hasDocument)
         }
 
         CommandGroup(replacing: .saveItem) {
@@ -519,6 +644,16 @@ struct ViewerCommands: Commands {
             }
             .disabled(!model.hasDocument)
         }
+
+        CommandGroup(after: .help) {
+            Button("Keyboard Shortcuts") {
+                model.showKeyboardShortcutsPanel()
+            }
+
+            Button(model.showsKeyboardShortcutsPanel ? "Hide Shortcuts Panel" : "Show Shortcuts Panel") {
+                model.toggleKeyboardShortcutsPanel()
+            }
+        }
     }
 }
 
@@ -527,6 +662,9 @@ final class PDFDocumentModel: ObservableObject {
     let minThumbnailPaneWidth: CGFloat = 120
     let maxThumbnailPaneWidth: CGFloat = 420
     let defaultThumbnailPaneWidth: CGFloat = 180
+    let minKeyboardShortcutsPanelWidth: CGFloat = 220
+    let maxKeyboardShortcutsPanelWidth: CGFloat = 420
+    let defaultKeyboardShortcutsPanelWidth: CGFloat = 280
 
     @Published var document: PDFDocument?
     @Published var recentFiles: [RecentFileItem] = []
@@ -548,7 +686,11 @@ final class PDFDocumentModel: ObservableObject {
     @Published var pendingStamp: PendingStamp?
     @Published var hasSelectedStamp = false
     @Published var searchStatus: String?
-    @Published var hasUnsavedChanges = false
+    @Published var hasUnsavedChanges = false {
+        didSet {
+            syncWindowEditedState()
+        }
+    }
     @Published var signatureImageData: Data? {
         didSet {
             if let signatureImageData {
@@ -584,19 +726,36 @@ final class PDFDocumentModel: ObservableObject {
             defaults.set(Double(clamped), forKey: PersistedKeys.thumbnailPaneWidth)
         }
     }
+    @Published var keyboardShortcutsPanelWidth: CGFloat = 280 {
+        didSet {
+            let clamped = clampedKeyboardShortcutsPanelWidth(keyboardShortcutsPanelWidth)
+            if clamped != keyboardShortcutsPanelWidth {
+                keyboardShortcutsPanelWidth = clamped
+                return
+            }
+            defaults.set(Double(clamped), forKey: PersistedKeys.keyboardShortcutsPanelWidth)
+        }
+    }
     @Published var persistedZoomScaleFactor: CGFloat = 1.0 {
         didSet {
             defaults.set(Double(persistedZoomScaleFactor), forKey: PersistedKeys.zoomScaleFactor)
+            persistCurrentDocumentZoomStateIfPossible()
         }
     }
     @Published var persistedZoomUsesAutoScale = true {
         didSet {
             defaults.set(persistedZoomUsesAutoScale, forKey: PersistedKeys.zoomUsesAutoScale)
+            persistCurrentDocumentZoomStateIfPossible()
         }
     }
     @Published var isFocusMode = false {
         didSet {
             defaults.set(isFocusMode, forKey: PersistedKeys.isFocusMode)
+        }
+    }
+    @Published var showsKeyboardShortcutsPanel = false {
+        didSet {
+            defaults.set(showsKeyboardShortcutsPanel, forKey: PersistedKeys.showsKeyboardShortcutsPanel)
         }
     }
     @Published var signerName = NSFullUserName() {
@@ -611,6 +770,26 @@ final class PDFDocumentModel: ObservableObject {
     private var windowDelegateProxy: UnsavedChangesWindowDelegate?
     private var hasAppliedSavedWindowFrame = false
     private var currentDocumentURL: URL?
+    private weak var keyboardShortcutsWindow: NSWindow?
+    private static let keyboardShortcutEntries: [(shortcut: String, action: String)] = [
+        ("Cmd+O", "Open PDF"),
+        ("Cmd+F", "Find"),
+        ("Cmd+G", "Find Next"),
+        ("Shift+Cmd+G", "Find Previous"),
+        ("Cmd+=", "Zoom In"),
+        ("Cmd+-", "Zoom Out"),
+        ("Cmd+0", "Actual Size"),
+        ("Shift+Cmd+F", "Toggle Focus Mode"),
+        ("Cmd+S", "Save"),
+        ("Shift+Cmd+S", "Save As"),
+        ("Option+Cmd+N", "Stamp Name"),
+        ("Option+Cmd+D", "Stamp Date"),
+        ("Option+Cmd+I", "Import Signature"),
+        ("Option+Cmd+S", "Stamp Signature"),
+        ("Option+Cmd+]", "Larger Selected Stamp"),
+        ("Option+Cmd+[", "Smaller Selected Stamp"),
+        ("Delete", "Delete Selected Stamp"),
+    ]
     private static let stampDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
@@ -627,6 +806,12 @@ final class PDFDocumentModel: ObservableObject {
         } else {
             thumbnailPaneWidth = defaultThumbnailPaneWidth
         }
+        let storedShortcutsPaneWidth = defaults.double(forKey: PersistedKeys.keyboardShortcutsPanelWidth)
+        if storedShortcutsPaneWidth > 0 {
+            keyboardShortcutsPanelWidth = clampedKeyboardShortcutsPanelWidth(CGFloat(storedShortcutsPaneWidth))
+        } else {
+            keyboardShortcutsPanelWidth = defaultKeyboardShortcutsPanelWidth
+        }
         if defaults.object(forKey: PersistedKeys.zoomScaleFactor) != nil {
             persistedZoomScaleFactor = max(CGFloat(defaults.double(forKey: PersistedKeys.zoomScaleFactor)), 0.1)
         }
@@ -634,6 +819,7 @@ final class PDFDocumentModel: ObservableObject {
             persistedZoomUsesAutoScale = defaults.bool(forKey: PersistedKeys.zoomUsesAutoScale)
         }
         isFocusMode = defaults.bool(forKey: PersistedKeys.isFocusMode)
+        showsKeyboardShortcutsPanel = defaults.bool(forKey: PersistedKeys.showsKeyboardShortcutsPanel)
         searchQuery = defaults.string(forKey: PersistedKeys.searchQuery) ?? ""
         if let storedSignerName = defaults.string(forKey: PersistedKeys.signerName),
            !storedSignerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -649,6 +835,18 @@ final class PDFDocumentModel: ObservableObject {
 
     var hasDocument: Bool {
         document != nil
+    }
+
+    var isDocumentModified: Bool {
+        hasDocument && hasUnsavedChanges
+    }
+
+    var currentDocumentDisplayName: String? {
+        currentDocumentURL?.lastPathComponent
+    }
+
+    var keyboardShortcutItems: [(shortcut: String, action: String)] {
+        Self.keyboardShortcutEntries
     }
 
     var canGoToPreviousPage: Bool {
@@ -677,6 +875,28 @@ final class PDFDocumentModel: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func showKeyboardShortcutsPanel() {
+        if let keyboardShortcutsWindow {
+            keyboardShortcutsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let panel = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Keyboard Shortcuts"
+        panel.isReleasedWhenClosed = true
+        panel.center()
+        panel.contentView = buildKeyboardShortcutsView()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        keyboardShortcutsWindow = panel
+    }
+
     func openPanel() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.pdf]
@@ -701,7 +921,9 @@ final class PDFDocumentModel: ObservableObject {
             return
         }
 
+        rehydrateManagedTextStamps(in: loadedDocument)
         currentDocumentURL = url
+        applyPersistedZoomState(for: url)
         document = loadedDocument
         let savedPage = defaults.integer(forKey: PersistedKeys.lastPageIndex)
         currentPageIndex = restorePage ? clampedPageIndex(savedPage, pageCount: loadedDocument.pageCount) : 0
@@ -711,6 +933,7 @@ final class PDFDocumentModel: ObservableObject {
         hasUnsavedChanges = false
         persistLastDocument(url)
         registerRecentFile(url)
+        syncWindowEditedState()
     }
 
     func openRecentFile(_ url: URL) {
@@ -724,6 +947,28 @@ final class PDFDocumentModel: ObservableObject {
 
     func clearRecentFiles() {
         persistRecentFiles([])
+    }
+
+    func closeDocument() {
+        guard document != nil else {
+            return
+        }
+
+        if !confirmDocumentTransitionIfNeeded(reason: .closeDocument) {
+            return
+        }
+
+        persistCurrentDocumentZoomStateIfPossible()
+        document = nil
+        currentDocumentURL = nil
+        currentPageIndex = 0
+        searchRequest = nil
+        pendingStamp = nil
+        hasSelectedStamp = false
+        hasUnsavedChanges = false
+        searchStatus = "PDF closed."
+        clearPersistedLastDocument()
+        syncWindowEditedState()
     }
 
     func goToPreviousPage() {
@@ -746,6 +991,10 @@ final class PDFDocumentModel: ObservableObject {
 
     func toggleFocusMode() {
         isFocusMode.toggle()
+    }
+
+    func toggleKeyboardShortcutsPanel() {
+        showsKeyboardShortcutsPanel.toggle()
     }
 
     func findNext() {
@@ -939,6 +1188,93 @@ final class PDFDocumentModel: ObservableObject {
         searchRequest = SearchRequest(query: trimmed, direction: direction)
     }
 
+    private func rehydrateManagedTextStamps(in document: PDFDocument) {
+        for pageIndex in 0..<document.pageCount {
+            guard let page = document.page(at: pageIndex) else {
+                continue
+            }
+
+            let textAnnotations = page.annotations.filter { annotation in
+                StampStyle.textContents(from: annotation) != nil && !(annotation is TextStampAnnotation)
+            }
+
+            for annotation in textAnnotations {
+                guard let text = StampStyle.textContents(from: annotation) else {
+                    continue
+                }
+                let replacement = TextStampAnnotation(
+                    bounds: annotation.bounds,
+                    text: text,
+                    fontSize: StampStyle.storedFontSize(from: annotation)
+                )
+                page.removeAnnotation(annotation)
+                page.addAnnotation(replacement)
+            }
+        }
+    }
+
+    private func buildKeyboardShortcutsView() -> NSView {
+        let contentView = NSView()
+
+        let titleLabel = NSTextField(labelWithString: "Hyeon's PDF Viewer")
+        titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let subtitleLabel = NSTextField(labelWithString: "Keyboard Shortcuts")
+        subtitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        textView.textContainerInset = NSSize(width: 10, height: 8)
+        textView.string = formattedKeyboardShortcutsText()
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .bezelBorder
+        scrollView.documentView = textView
+
+        contentView.addSubview(titleLabel)
+        contentView.addSubview(subtitleLabel)
+        contentView.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 14),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+
+            scrollView.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 10),
+            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -14),
+            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14),
+        ])
+
+        return contentView
+    }
+
+    private func formattedKeyboardShortcutsText() -> String {
+        let maxShortcutLength = Self.keyboardShortcutEntries
+            .map(\.shortcut.count)
+            .max() ?? 0
+
+        return Self.keyboardShortcutEntries.map { entry in
+            let spacingCount = max(2, (maxShortcutLength - entry.shortcut.count) + 2)
+            let spacing = String(repeating: " ", count: spacingCount)
+            return "\(entry.shortcut)\(spacing)\(entry.action)"
+        }
+        .joined(separator: "\n")
+    }
+
     private func restorePersistedSignatureIfPossible() {
         guard let storedSignatureData = defaults.data(forKey: PersistedKeys.signatureImageData) else {
             return
@@ -975,6 +1311,7 @@ final class PDFDocumentModel: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         observedWindow = window
+        syncWindowEditedState()
         applySavedWindowFrame(to: window)
         let proxy = UnsavedChangesWindowDelegate(
             model: self,
@@ -1072,9 +1409,15 @@ final class PDFDocumentModel: ObservableObject {
         confirmDocumentTransitionIfNeeded(reason: .closeWindow)
     }
 
+    fileprivate func confirmApplicationQuitIfNeeded() -> Bool {
+        confirmDocumentTransitionIfNeeded(reason: .quitApplication)
+    }
+
     private enum DocumentTransitionReason {
         case openAnotherDocument
+        case closeDocument
         case closeWindow
+        case quitApplication
     }
 
     private func confirmDocumentTransitionIfNeeded(reason: DocumentTransitionReason) -> Bool {
@@ -1088,8 +1431,12 @@ final class PDFDocumentModel: ObservableObject {
         switch reason {
         case .openAnotherDocument:
             alert.informativeText = "Your stamp changes will be lost if you open another file without saving."
+        case .closeDocument:
+            alert.informativeText = "Your stamp changes will be lost if you close this PDF without saving."
         case .closeWindow:
             alert.informativeText = "Your stamp changes will be lost if you close this window without saving."
+        case .quitApplication:
+            alert.informativeText = "Your stamp changes will be lost if you quit Hyeon's PDF Viewer without saving."
         }
 
         alert.addButton(withTitle: "Save")
@@ -1134,6 +1481,51 @@ final class PDFDocumentModel: ObservableObject {
 
     private func persistWindowFrame(_ frame: NSRect) {
         defaults.set(NSStringFromRect(frame), forKey: PersistedKeys.windowFrame)
+    }
+
+    private func syncWindowEditedState() {
+        observedWindow?.isDocumentEdited = hasDocument && hasUnsavedChanges
+    }
+
+    private func clearPersistedLastDocument() {
+        defaults.removeObject(forKey: PersistedKeys.lastDocumentBookmark)
+        defaults.removeObject(forKey: PersistedKeys.lastDocumentPath)
+        defaults.removeObject(forKey: PersistedKeys.lastPageIndex)
+    }
+
+    private func clampedKeyboardShortcutsPanelWidth(_ width: CGFloat) -> CGFloat {
+        min(max(width, minKeyboardShortcutsPanelWidth), maxKeyboardShortcutsPanelWidth)
+    }
+
+    private func persistedDocumentZoomStates() -> [String: [String: Any]] {
+        defaults.dictionary(forKey: PersistedKeys.documentZoomStates) as? [String: [String: Any]] ?? [:]
+    }
+
+    private func persistCurrentDocumentZoomStateIfPossible() {
+        guard let currentDocumentURL else {
+            return
+        }
+        let storageKey = currentDocumentURL.standardizedFileURL.path
+        var zoomStates = persistedDocumentZoomStates()
+        zoomStates[storageKey] = [
+            "scaleFactor": Double(persistedZoomScaleFactor),
+            "usesAutoScale": persistedZoomUsesAutoScale,
+        ]
+        defaults.set(zoomStates, forKey: PersistedKeys.documentZoomStates)
+    }
+
+    private func applyPersistedZoomState(for url: URL) {
+        let storageKey = url.standardizedFileURL.path
+        let zoomStates = persistedDocumentZoomStates()
+        if let state = zoomStates[storageKey],
+           let scaleFactor = state["scaleFactor"] as? Double,
+           let usesAutoScale = state["usesAutoScale"] as? Bool {
+            persistedZoomScaleFactor = max(CGFloat(scaleFactor), 0.1)
+            persistedZoomUsesAutoScale = usesAutoScale
+        } else {
+            persistedZoomScaleFactor = 1.0
+            persistedZoomUsesAutoScale = true
+        }
     }
 
     private func clampedThumbnailWidth(_ width: CGFloat) -> CGFloat {
@@ -1227,14 +1619,28 @@ final class UnsavedChangesWindowDelegate: NSObject, NSWindowDelegate {
 struct ContentView: View {
     @EnvironmentObject private var model: PDFDocumentModel
     @FocusState private var isSearchFieldFocused: Bool
+    @State private var keyboardShortcutsDragStartWidth: CGFloat?
+    @State private var activeKeyboardShortcutsPanelWidth: CGFloat = 280
 
     var body: some View {
         VStack(spacing: 0) {
             if !model.isFocusMode {
                 VStack(spacing: 8) {
                     HStack(spacing: 10) {
-                        Button("Open PDF", action: model.openPanel)
-                            .keyboardShortcut("o", modifiers: [.command])
+                        Menu("File") {
+                            Button("Open PDF...", action: model.openPanel)
+                            Button("Save") {
+                                _ = model.saveDocument()
+                            }
+                            .disabled(!model.hasDocument)
+                            Button("Save As...") {
+                                _ = model.saveDocumentAs()
+                            }
+                            .disabled(!model.hasDocument)
+                            Divider()
+                            Button("Close PDF", action: model.closeDocument)
+                                .disabled(!model.hasDocument)
+                        }
 
                         ControlGroup {
                             Button("Previous", action: model.goToPreviousPage)
@@ -1248,6 +1654,9 @@ struct ContentView: View {
                             .disabled(!model.hasDocument)
 
                         Button("Focus", action: model.toggleFocusMode)
+
+                        Toggle("Shortcuts", isOn: $model.showsKeyboardShortcutsPanel)
+                            .toggleStyle(.button)
 
                         Menu("Zoom") {
                             Button("Zoom Out", action: model.zoomOut)
@@ -1318,6 +1727,13 @@ struct ContentView: View {
 
                         if model.hasDocument {
                             HStack(spacing: 10) {
+                                if let documentName = model.currentDocumentDisplayName {
+                                    Text(documentName)
+                                        .lineLimit(1)
+                                }
+                                Text(model.isDocumentModified ? "Modified" : "Saved")
+                                    .foregroundStyle(model.isDocumentModified ? .orange : .secondary)
+                                    .lineLimit(1)
                                 if let stamp = model.pendingStamp {
                                     Text("Click to place: \(pendingStampLabel(stamp))")
                                         .foregroundStyle(.secondary)
@@ -1348,35 +1764,52 @@ struct ContentView: View {
                 Divider()
             }
 
-            if let document = model.document {
-                PDFKitView(
-                    document: document,
-                    currentPageIndex: $model.currentPageIndex,
-                    showsThumbnails: model.showsThumbnails,
-                    thumbnailPaneWidth: $model.thumbnailPaneWidth,
-                    minThumbnailPaneWidth: model.minThumbnailPaneWidth,
-                    maxThumbnailPaneWidth: model.maxThumbnailPaneWidth,
-                    searchRequest: model.searchRequest,
-                    zoomRequest: model.zoomRequest,
-                    deleteSelectedStampRequest: model.deleteSelectedStampRequest,
-                    resizeSelectedStampRequest: model.resizeSelectedStampRequest,
-                    pendingStamp: $model.pendingStamp,
-                    hasSelectedStamp: $model.hasSelectedStamp,
-                    hasUnsavedChanges: $model.hasUnsavedChanges,
-                    persistedZoomScaleFactor: $model.persistedZoomScaleFactor,
-                    persistedZoomUsesAutoScale: $model.persistedZoomUsesAutoScale,
-                    searchStatus: $model.searchStatus
-                )
-                    .background(Color(nsColor: NSColor.textBackgroundColor))
-            } else {
-                VStack(spacing: 10) {
-                    Text("Hyeon's PDF Viewer")
-                        .font(.title2)
-                    Text("Use Open PDF to choose a local file.")
-                        .foregroundStyle(.secondary)
+            HStack(spacing: 0) {
+                Group {
+                    if let document = model.document {
+                        PDFKitView(
+                            document: document,
+                            currentPageIndex: $model.currentPageIndex,
+                            showsThumbnails: model.showsThumbnails,
+                            thumbnailPaneWidth: $model.thumbnailPaneWidth,
+                            minThumbnailPaneWidth: model.minThumbnailPaneWidth,
+                            maxThumbnailPaneWidth: model.maxThumbnailPaneWidth,
+                            searchRequest: model.searchRequest,
+                            zoomRequest: model.zoomRequest,
+                            deleteSelectedStampRequest: model.deleteSelectedStampRequest,
+                            resizeSelectedStampRequest: model.resizeSelectedStampRequest,
+                            pendingStamp: $model.pendingStamp,
+                            hasSelectedStamp: $model.hasSelectedStamp,
+                            hasUnsavedChanges: $model.hasUnsavedChanges,
+                            persistedZoomScaleFactor: $model.persistedZoomScaleFactor,
+                            persistedZoomUsesAutoScale: $model.persistedZoomUsesAutoScale,
+                            searchStatus: $model.searchStatus
+                        )
+                        .background(Color(nsColor: NSColor.textBackgroundColor))
+                    } else {
+                        VStack(spacing: 10) {
+                            Text("Hyeon's PDF Viewer")
+                                .font(.title2)
+                            Text("Use Open PDF to choose a local file.")
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(nsColor: NSColor.windowBackgroundColor))
+                    }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(nsColor: NSColor.windowBackgroundColor))
+
+                if model.showsKeyboardShortcutsPanel {
+                    KeyboardShortcutsResizeHandle(
+                        width: $activeKeyboardShortcutsPanelWidth,
+                        committedWidth: $model.keyboardShortcutsPanelWidth,
+                        minWidth: model.minKeyboardShortcutsPanelWidth,
+                        maxWidth: model.maxKeyboardShortcutsPanelWidth,
+                        dragStartWidth: $keyboardShortcutsDragStartWidth
+                    )
+                    KeyboardShortcutsSidebar(shortcuts: model.keyboardShortcutItems)
+                        .frame(width: activeKeyboardShortcutsPanelWidth)
+                        .background(Color(nsColor: NSColor.controlBackgroundColor))
+                }
             }
         }
         .background(
@@ -1386,6 +1819,14 @@ struct ContentView: View {
         )
         .onChange(of: model.searchFieldFocusRequestID) { _ in
             isSearchFieldFocused = true
+        }
+        .onAppear {
+            activeKeyboardShortcutsPanelWidth = model.keyboardShortcutsPanelWidth
+        }
+        .onChange(of: model.keyboardShortcutsPanelWidth) { newValue in
+            if keyboardShortcutsDragStartWidth == nil {
+                activeKeyboardShortcutsPanelWidth = newValue
+            }
         }
         .overlay(alignment: .topTrailing) {
             if model.isFocusMode {
@@ -1403,6 +1844,85 @@ struct ContentView: View {
             return text
         case .signatureImage:
             return "Signature"
+        }
+    }
+}
+
+struct KeyboardShortcutsResizeHandle: View {
+    @Binding var width: CGFloat
+    @Binding var committedWidth: CGFloat
+    let minWidth: CGFloat
+    let maxWidth: CGFloat
+    @Binding var dragStartWidth: CGFloat?
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .clear)
+            Rectangle()
+                .fill(Color(nsColor: NSColor.separatorColor))
+                .frame(width: 1)
+        }
+        .frame(width: 10)
+        .contentShape(Rectangle())
+        .onHover { isHovering in
+            if isHovering {
+                NSCursor.resizeLeftRight.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    if dragStartWidth == nil {
+                        dragStartWidth = width
+                    }
+                    let startWidth = dragStartWidth ?? width
+                    let proposedWidth = startWidth - value.translation.width
+                    width = min(max(proposedWidth, minWidth), maxWidth)
+                }
+                .onEnded { _ in
+                    committedWidth = width
+                    dragStartWidth = nil
+                }
+        )
+    }
+}
+
+struct KeyboardShortcutsSidebar: View {
+    let shortcuts: [(shortcut: String, action: String)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Keyboard Shortcuts")
+                    .font(.headline)
+                Text("Quick reference")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(shortcuts.enumerated()), id: \.offset) { _, entry in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(entry.shortcut)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .frame(width: 108, alignment: .leading)
+                            Text(entry.action)
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                .padding(16)
+            }
         }
     }
 }
@@ -1705,6 +2225,37 @@ struct PDFKitView: NSViewRepresentable {
             guard let page = selectedStampPage,
                   let annotation = selectedStampAnnotation else {
                 return false
+            }
+
+            if let text = StampStyle.textContents(from: annotation) {
+                let currentFontSize = StampStyle.storedFontSize(from: annotation)
+                let targetFontSize = StampStyle.clampedFontSize(currentFontSize * scaleFactor)
+                guard abs(targetFontSize - currentFontSize) > 0.01 else {
+                    return false
+                }
+
+                let resizedBounds = StampStyle.resizedTextBounds(
+                    for: text,
+                    fontSize: targetFontSize,
+                    centeredAt: CGPoint(x: annotation.bounds.midX, y: annotation.bounds.midY),
+                    within: page.bounds(for: displayBox)
+                )
+
+                guard resizedBounds != annotation.bounds else {
+                    return false
+                }
+
+                let replacement = TextStampAnnotation(
+                    bounds: resizedBounds,
+                    text: text,
+                    fontSize: targetFontSize
+                )
+                page.removeAnnotation(annotation)
+                page.addAnnotation(replacement)
+                selectedStampAnnotation = replacement
+                selectedStampPage = page
+                refreshOverlay()
+                return true
             }
 
             let currentBounds = annotation.bounds
@@ -2067,6 +2618,8 @@ struct PDFKitView: NSViewRepresentable {
         private var isApplyingProgrammaticWidth = false
         private var panStartSidebarWidth: CGFloat = 0
         private var isSidebarVisible = false
+        private var isUserResizingSidebar = false
+        private var lastAppliedThumbnailSize: NSSize = .zero
 
         init(minThumbnailWidth: CGFloat, maxThumbnailWidth: CGFloat) {
             self.minThumbnailWidth = minThumbnailWidth
@@ -2148,15 +2701,25 @@ struct PDFKitView: NSViewRepresentable {
                     needsLayout = true
                 }
 
+                if isUserResizingSidebar {
+                    return
+                }
+
                 let normalizedWidth = clampedThumbnailWidth(preferredWidth)
                 if bounds.width > 0 {
-                    setThumbnailWidth(normalizedWidth)
+                    let appliedWidth = clampedSplitPosition(normalizedWidth)
+                    if abs(sidebarWidthConstraint.constant - appliedWidth) > 0.5 {
+                        setThumbnailWidth(normalizedWidth)
+                    }
                 } else {
                     DispatchQueue.main.async { [weak self] in
                         self?.setThumbnailWidth(normalizedWidth)
                     }
                 }
             } else {
+                guard isSidebarVisible || !sidebarContainer.isHidden || sidebarWidthConstraint.constant != 0 else {
+                    return
+                }
                 isSidebarVisible = false
                 sidebarContainer.isHidden = true
                 dividerView.isHidden = true
@@ -2207,6 +2770,7 @@ struct PDFKitView: NSViewRepresentable {
 
             switch recognizer.state {
             case .began:
+                isUserResizingSidebar = true
                 panStartSidebarWidth = sidebarWidthConstraint.constant
             case .changed:
                 let translation = recognizer.translation(in: self)
@@ -2215,8 +2779,12 @@ struct PDFKitView: NSViewRepresentable {
                 sidebarWidthConstraint.constant = clampedWidth
                 updateThumbnailSize(forSidebarWidth: clampedWidth)
                 needsLayout = true
+                layoutSubtreeIfNeeded()
+            case .ended, .cancelled:
+                isUserResizingSidebar = false
+                let committedWidth = sidebarWidthConstraint.constant
                 if !isApplyingProgrammaticWidth {
-                    onThumbnailWidthChanged?(clampedWidth)
+                    onThumbnailWidthChanged?(committedWidth)
                 }
             default:
                 break
@@ -2228,7 +2796,13 @@ struct PDFKitView: NSViewRepresentable {
             let targetWidth = max(64, width - horizontalPadding)
             let aspectRatio = currentDocumentPageAspectRatio()
             let targetHeight = max(84, targetWidth * aspectRatio)
-            thumbnailView.thumbnailSize = NSSize(width: targetWidth, height: targetHeight)
+            let newSize = NSSize(width: targetWidth, height: targetHeight)
+            guard abs(lastAppliedThumbnailSize.width - newSize.width) > 0.5 ||
+                    abs(lastAppliedThumbnailSize.height - newSize.height) > 0.5 else {
+                return
+            }
+            lastAppliedThumbnailSize = newSize
+            thumbnailView.thumbnailSize = newSize
         }
 
         private func currentDocumentPageAspectRatio() -> CGFloat {
@@ -2248,6 +2822,7 @@ struct PDFKitView: NSViewRepresentable {
 extension PDFKitView {
     @MainActor
     final class Coordinator: NSObject {
+        private let zoomStepScale: CGFloat = 1.08
         var parent: PDFKitView
         var lastQuery = ""
         var lastSelection: PDFSelection?
@@ -2392,10 +2967,10 @@ extension PDFKitView {
             switch request.action {
             case .inStep:
                 pdfView.autoScales = false
-                pdfView.zoomIn(nil)
+                pdfView.scaleFactor = min(pdfView.scaleFactor * zoomStepScale, pdfView.maxScaleFactor)
             case .outStep:
                 pdfView.autoScales = false
-                pdfView.zoomOut(nil)
+                pdfView.scaleFactor = max(pdfView.scaleFactor / zoomStepScale, pdfView.minScaleFactor)
             case .actualSize:
                 pdfView.autoScales = false
                 pdfView.scaleFactor = min(max(1.0, pdfView.minScaleFactor), pdfView.maxScaleFactor)
@@ -2451,15 +3026,11 @@ extension PDFKitView {
         private func addStampAnnotation(text: String, on page: PDFPage, at point: CGPoint, pdfView: PDFView) {
             let pageBounds = page.bounds(for: pdfView.displayBox)
             let bounds = StampStyle.bounds(for: text, at: point, within: pageBounds)
-            let annotation = PDFAnnotation(bounds: bounds, forType: .freeText, withProperties: nil)
-            annotation.font = StampStyle.font()
-            annotation.fontColor = .black
-            annotation.color = .clear
-            annotation.alignment = .left
-            annotation.contents = text
-            annotation.isReadOnly = true
-            annotation.shouldPrint = true
-            annotation.setValue(StampStyle.subject, forAnnotationKey: StampStyle.markerKey)
+            let annotation = TextStampAnnotation(
+                bounds: bounds,
+                text: text,
+                fontSize: StampStyle.fontSize
+            )
             page.addAnnotation(annotation)
         }
 
