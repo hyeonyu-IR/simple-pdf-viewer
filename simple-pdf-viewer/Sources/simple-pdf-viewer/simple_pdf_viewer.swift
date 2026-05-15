@@ -849,6 +849,43 @@ final class PDFDocumentModel: ObservableObject {
         Self.keyboardShortcutEntries
     }
 
+    var contextualHelp: (title: String, message: String) {
+        if let pendingStamp {
+            switch pendingStamp.content {
+            case .text(let text):
+                let label = text == signerName.trimmingCharacters(in: .whitespacesAndNewlines) ? "Name Stamp" : "Text Stamp"
+                return (
+                    title: label,
+                    message: "Move the cursor to position the preview, then click the page to place \"\(text)\"."
+                )
+            case .signatureImage:
+                return (
+                    title: "Signature Stamp",
+                    message: "Move the cursor to position the preview, then click the page to place the signature."
+                )
+            }
+        }
+
+        if hasSelectedStamp {
+            return (
+                title: "Selected Stamp",
+                message: "Use Option+Cmd+[ / ] to resize. Drag to move. Press Delete to remove."
+            )
+        }
+
+        if !hasDocument {
+            return (
+                title: "Getting Started",
+                message: "Open a PDF from the File menu or press Cmd+O. The Thumbnail and Shortcuts buttons toggle the side panels."
+            )
+        }
+
+        return (
+            title: "Quick Help",
+            message: "Use the File menu to save, the Zoom menu or Cmd+= / Cmd+- to adjust view, and Shift+Cmd+F for focus mode."
+        )
+    }
+
     var canGoToPreviousPage: Bool {
         currentPageIndex > 0
     }
@@ -1806,7 +1843,10 @@ struct ContentView: View {
                         maxWidth: model.maxKeyboardShortcutsPanelWidth,
                         dragStartWidth: $keyboardShortcutsDragStartWidth
                     )
-                    KeyboardShortcutsSidebar(shortcuts: model.keyboardShortcutItems)
+                    KeyboardShortcutsSidebar(
+                        shortcuts: model.keyboardShortcutItems,
+                        contextualHelp: model.contextualHelp
+                    )
                         .frame(width: activeKeyboardShortcutsPanelWidth)
                         .background(Color(nsColor: NSColor.controlBackgroundColor))
                 }
@@ -1891,9 +1931,39 @@ struct KeyboardShortcutsResizeHandle: View {
 
 struct KeyboardShortcutsSidebar: View {
     let shortcuts: [(shortcut: String, action: String)]
+    let contextualHelp: (title: String, message: String)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Quick Help")
+                    .font(.headline)
+                Text("Context for what you are doing")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            VStack(alignment: .leading, spacing: 6) {
+                if contextualHelp.title != "Quick Help" {
+                    Text(contextualHelp.title)
+                        .font(.subheadline.weight(.semibold))
+                }
+                Text(contextualHelp.message)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .background(Color(nsColor: NSColor.windowBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+
+            Divider()
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("Keyboard Shortcuts")
                     .font(.headline)
@@ -1904,8 +1974,6 @@ struct KeyboardShortcutsSidebar: View {
             .padding(.horizontal, 16)
             .padding(.top, 16)
             .padding(.bottom, 12)
-
-            Divider()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -2856,8 +2924,8 @@ extension PDFKitView {
 
         func handleStampSelectionChanged(_ isSelected: Bool) {
             parent.hasSelectedStamp = isSelected
-            if isSelected {
-                parent.searchStatus = "Stamp selected. Drag to move, Option+Cmd+[ or ] to resize, Delete to remove."
+            if !isSelected, parent.searchStatus == "Stamp selected." {
+                parent.searchStatus = nil
             }
         }
 
